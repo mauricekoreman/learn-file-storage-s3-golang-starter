@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -33,26 +37,23 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
-	// TODO: implement the upload here
 	r.ParseMultipartForm(maxMemory)
 
-	// get image date from form
-	file, header, err := r.FormFile("thumbnail")
+	thumbnail, header, err := r.FormFile("thumbnail")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "something went wrong retrieving the form data", err)
 		return
 	}
-	defer file.Close()
+	defer thumbnail.Close()
 
-	mediaType := header.Header.Get("Content-Type")
+	mediaType, _, _ := mime.ParseMediaType(header.Header.Get("Content-Type"))
 	if mediaType == "" {
 		respondWithError(w, http.StatusBadRequest, "Missing Content-Type for thumbnail", err)
 		return
 	}
 
-	imageData, err := io.ReadAll(file)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't read thumbnail file", err)
+	if mediaType != "image/jpeg" && mediaType != "image/png" {
+		respondWithError(w, http.StatusBadRequest, "wrong image type for thumbnail", err)
 		return
 	}
 
@@ -67,18 +68,48 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	videoThumbnails[videoID] = thumbnail{
-		data:      imageData,
-		mediaType: mediaType,
+	// creates a 32-byte slice to hold data
+	randBytes := make([]byte, 32)
+
+	// fills the byte slice with random bytes.
+	_, err = rand.Read(randBytes)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error creating thumbnail random ID", err)
+		return
 	}
 
-	newThumbnailURL := fmt.Sprintf("http://localhost:%s/api/thumbnails/%s", cfg.port, videoID)
-	videoData.ThumbnailURL = &newThumbnailURL
+	// encode random bytes into a URL-safe base64 string
+	randomBase64String := base64.RawURLEncoding.EncodeToString(randBytes)
+	assetPath := getAssetPath(randomBase64String, mediaType)
+	assetDiskPath := cfg.getAssetDiskPath(assetPath)
+
+	dst, err := os.Create(assetDiskPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to create file", err)
+		return
+	}
+	defer dst.Close()
+	_, err = io.Copy(dst, thumbnail)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error saving file", err)
+		return
+	}
+
+	thumbnailURL := cfg.getAssetURL(assetPath)
+	oldThumbnail := getAssetFromURL(*videoData.ThumbnailURL)
+	videoData.ThumbnailURL = &thumbnailURL
 
 	err = cfg.db.UpdateVideo(videoData)
 	if err != nil {
-		delete(videoThumbnails, videoID)
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video data", err)
+		return
+	}
+
+	// delete old URL from disk
+	oldThumbnailPath := fmt.Sprintf("./assets/%s", oldThumbnail)
+	err = os.Remove(oldThumbnailPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error removing old thumbnail", err)
 		return
 	}
 
