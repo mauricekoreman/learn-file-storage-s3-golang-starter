@@ -37,7 +37,11 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
-	r.ParseMultipartForm(maxMemory)
+	err = r.ParseMultipartForm(maxMemory)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "File size too big", err)
+		return
+	}
 
 	thumbnail, header, err := r.FormFile("thumbnail")
 	if err != nil {
@@ -89,6 +93,7 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer dst.Close()
+
 	_, err = io.Copy(dst, thumbnail)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error saving file", err)
@@ -96,7 +101,12 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 
 	thumbnailURL := cfg.getAssetURL(assetPath)
-	oldThumbnail := getAssetFromURL(*videoData.ThumbnailURL)
+
+	var oldThumbnail string
+	if videoData.ThumbnailURL != nil {
+		oldThumbnail = getAssetFromURL(*videoData.ThumbnailURL)
+	}
+
 	videoData.ThumbnailURL = &thumbnailURL
 
 	err = cfg.db.UpdateVideo(videoData)
@@ -105,12 +115,14 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// delete old URL from disk
-	oldThumbnailPath := fmt.Sprintf("./assets/%s", oldThumbnail)
-	err = os.Remove(oldThumbnailPath)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error removing old thumbnail", err)
-		return
+	// Only try to delete old thumbnail if there was one
+	if oldThumbnail != "" {
+		oldThumbnailPath := fmt.Sprintf("./assets/%s", oldThumbnail)
+		err = os.Remove(oldThumbnailPath)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Error removing old thumbnail", err)
+			return
+		}
 	}
 
 	respondWithJSON(w, http.StatusOK, videoData)
