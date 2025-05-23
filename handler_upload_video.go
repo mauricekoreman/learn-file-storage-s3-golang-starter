@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -19,6 +22,11 @@ import (
 
 // 1 GB
 const maxVideoSize = 1 << 30
+
+const (
+	Portrait  = "9:16"
+	Landscape = "16:9"
+)
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	videoIDString := r.PathValue("videoID")
@@ -74,6 +82,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
+
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error creating file", err)
 		return
@@ -84,6 +93,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = io.Copy(tempFile, file)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error copying file", err)
+		return
+	}
+
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get aspect ratio of video", err)
 		return
 	}
 
@@ -106,10 +121,15 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	// encode random bytes into a URL-safe base64 string
 	randomBase64String := base64.RawURLEncoding.EncodeToString(randBytes)
 
+	aspect := "portrait"
+	if aspectRatio == Landscape {
+		aspect = "landscape"
+	}
+
 	uploader := manager.NewUploader(cfg.s3Client)
 	result, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
-		Key:         aws.String(randomBase64String),
+		Key:         aws.String(fmt.Sprintf("%s/%s", aspect, randomBase64String)),
 		Body:        tempFile,
 		ContentType: &mediaType,
 	})
@@ -128,4 +148,51 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusCreated)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	var stdout bytes.Buffer
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("failed to run ffprobe: %w", err)
+	}
+
+	var result struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		}
+	}
+
+	if err = json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return "", fmt.Errorf("failed to parse ffprobe output: %w", err)
+	}
+
+	if len(result.Streams) == 0 {
+		return "", fmt.Errorf("no streamsa found in video")
+	}
+
+	// Find the first video stream with width and height
+	for _, stream := range result.Streams {
+		if stream.Width > 0 && stream.Height > 0 {
+			// Calculate greatest common divisor to simplify the ratio
+			gcd := func(a, b int) int {
+				for b != 0 {
+					a, b = b, a%b
+				}
+				return a
+			}
+
+			divisor := gcd(stream.Width, stream.Height)
+			calcWidth := stream.Width / divisor
+			calcHeight := stream.Height / divisor
+
+			return fmt.Sprintf("%d:%d", calcWidth, calcHeight), nil
+		}
+	}
+
+	return "", fmt.Errorf("no video stream with valid dimensions found")
 }
